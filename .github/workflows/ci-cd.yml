@@ -1,0 +1,95 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: [training_data.csv]
+  pull_request:
+    branches: [main]
+    paths: [training_data.csv]
+
+concurrency:
+  group: model-${{ github.ref }}
+  queue: max
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Train linear model
+        run: python train_model.py
+      - name: Save model coefficients for publishing
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-coefficients
+          path: linear_model.txt
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    if: github.event_name == 'push'
+    needs: train
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-coefficients
+          path: ${{ runner.temp }}/model
+      - name: Update release branch and publish model
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${GITHUB_RUN_NUMBER}"
+          tag_ref="refs/tags/$tag"
+          model="$RUNNER_TEMP/model/linear_model.txt"
+
+          remote_tag=$(git ls-remote --refs origin "$tag_ref")
+          if [[ -z "$remote_tag" ]]; then
+            git fetch --no-tags origin refs/heads/main
+            if ! git diff --quiet "$GITHUB_SHA" FETCH_HEAD -- training_data.csv; then
+              echo "A newer training dataset is available on main."
+              exit 0
+            fi
+
+            release_branch=$(git ls-remote --refs origin refs/heads/release)
+            if [[ -n "$release_branch" ]]; then
+              git fetch --no-tags origin refs/heads/release
+              git switch --detach FETCH_HEAD
+            else
+              git switch --orphan release
+            fi
+
+            cp "$model" linear_model.txt
+            git add -f -- linear_model.txt
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit --allow-empty -m "Publish model $tag" -m "Training source: $GITHUB_SHA"
+            git push --atomic origin HEAD:refs/heads/release "HEAD:$tag_ref"
+          fi
+
+          if draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [[ "$draft" == 'true' ]]; then
+              gh release upload "$tag" "$model" --clobber
+              gh release edit "$tag" --draft=false
+            fi
+          else
+            gh release create "$tag" "$model" --verify-tag \
+              --title "Release $tag" \
+              --notes "Coefficients and intercept trained from $GITHUB_SHA by GitHub Actions."
+          fi
